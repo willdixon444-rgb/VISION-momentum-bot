@@ -1,1 +1,1 @@
-worker: python vision_engine.py
+web: gunicorn app:app --worker-class eventlet
