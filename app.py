@@ -14,7 +14,7 @@ logger = logging.getLogger("VISION")
 app = Flask(__name__)
 engine = VisionEngine()
 
-# Vision Dark-Mode UI
+# Vision Dark-Mode UI with Test Button
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html>
@@ -31,6 +31,8 @@ DASHBOARD_HTML = """
         .pill { background: #18182e; padding: 4px 10px; border-radius: 4px; font-size: 0.8rem; margin-right: 5px; }
         .green { color: #22c55e; }
         .red { color: #ef4444; }
+        .test-btn { background: #a855f7; color: white; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-family: monospace; margin-bottom: 20px; font-size: 1rem; }
+        .test-btn:hover { background: #7c3aed; }
     </style>
 </head>
 <body>
@@ -38,11 +40,24 @@ DASHBOARD_HTML = """
         <div><span class="glow">●</span> VISION | Warrior Trading Bot</div>
         <div id="clock"></div>
     </div>
+    <button class="test-btn" onclick="triggerScan()">🔄 Manual Test Scan</button>
     <h2>🏆 Top 10 Momentum Stocks</h2>
     <div id="top10">
-        <div class="card">Loading scanner data...</div>
+        <div class="card">Loading scanner data... Click the button above to test.</div>
     </div>
     <script>
+        function triggerScan() {
+            document.getElementById('top10').innerHTML = '<div class="card">⏳ Scanning 100+ stocks... Please wait 10-15 seconds.</div>';
+            fetch('/api/test_scan')
+                .then(res => res.json())
+                .then(data => {
+                    alert(data.message);
+                    updateDashboard();
+                })
+                .catch(err => {
+                    alert('Error: ' + err);
+                });
+        }
         function updateDashboard() {
             fetch('/api/top10')
                 .then(res => res.json())
@@ -64,6 +79,8 @@ DASHBOARD_HTML = """
                             `;
                         });
                         document.getElementById('top10').innerHTML = html;
+                    } else {
+                        document.getElementById('top10').innerHTML = '<div class="card">No qualified stocks found. Try again or wait for market hours.</div>';
                     }
                     document.getElementById('clock').innerText = new Date().toLocaleTimeString('en-US', {timeZone: 'America/New_York'});
                 });
@@ -94,6 +111,15 @@ def get_top10():
     return jsonify({
         "candidates": engine.top_candidates if hasattr(engine, 'top_candidates') else []
     })
+
+@app.route('/api/test_scan')
+def test_scan():
+    """Manual test endpoint to force a scan (weekend testing only)"""
+    try:
+        engine.hunt_momentum()
+        return jsonify({"status": "success", "message": "Manual scan triggered. Check Telegram for alerts."})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)})
 
 if __name__ == "__main__":
     engine.start()
