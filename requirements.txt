@@ -3,7 +3,7 @@ gunicorn
 eventlet
 yfinance
 pandas
-pandas_ta
+pandas-ta
 pytz
 requests
 python-dotenv
