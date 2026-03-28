@@ -1,6 +1,3 @@
-import eventlet
-eventlet.monkey_patch()
-
 import os
 import logging
 from flask import Flask, render_template_string, jsonify
@@ -14,7 +11,7 @@ logger = logging.getLogger("VISION")
 app = Flask(__name__)
 engine = VisionEngine()
 
-# Vision Dark-Mode UI with Test Button
+# Vision Dark-Mode UI
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html>
