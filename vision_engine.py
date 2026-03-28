@@ -1,68 +1,60 @@
-import os
-import time
 import pytz
 import logging
-import yfinance as yf
 from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
-from telegram_poster import post_trade_entry  # Using your Merlin Telegram file
+from telegram_poster import post_trade_entry
+from vision_scanner import VisionRossScanner
 
 logger = logging.getLogger("VISION_ENGINE")
 
 class VisionEngine:
     def __init__(self):
         self.scheduler = BackgroundScheduler(timezone="America/New_York")
-        # Watchlist of high-probability gappers
-        self.base_watchlist = ["ASTS", "QUBT", "LUNR", "SATS", "NKTR", "MOBX", "CECO"]
-
-    def get_live_metrics(self, symbol):
-        """Fetches the Ross 5-Pillar data + Reversal Indicators"""
-        try:
-            ticker = yf.Ticker(symbol)
-            df = ticker.history(period="1d", interval="1m")
-            if df.empty or len(df) < 20: return None
-
-            # Calculate RVOL
-            avg_vol = df['Volume'].mean()
-            current_vol = df['Volume'].iloc[-1]
-            rvol = current_vol / avg_vol
-
-            # Indicator Logic: SAR & ADX
-            # Simplified for Paste-Ready use
-            price = df['Close'].iloc[-1]
-            
-            return {
-                "symbol": symbol,
-                "price": round(price, 2),
-                "rvol": round(rvol, 1),
-                "gap": 10.0  # Placeholder for calculation
-            }
-        except Exception as e:
-            logger.error(f"Error fetching {symbol}: {e}")
-            return None
+        self.scanner = VisionRossScanner()
+        self.top_candidates = []
 
     def hunt_momentum(self):
-        """The 1-minute 'Live Watch' loop"""
+        """Warrior Trading: Scan 100+ stocks, find top 10, send alerts"""
         now = datetime.now(pytz.timezone("America/New_York"))
         
-        # Prime Time Filter (Monday Morning 7am-11am)
-        if 7 <= now.hour <= 11:
-            logger.info(f"Scanning Watchlist for Reversal/Momentum...")
-            for ticker in self.base_watchlist:
-                data = self.get_live_metrics(ticker)
-                
-                if data and data['rvol'] > 5.0:
-                    # INSTANT REVERSAL ALERT Trigger
+        # Trading hours: 6:30 AM - 1:00 PM ET (pre-market through lunch)
+        if 6 <= now.hour <= 13:
+            logger.info("🔍 Running Warrior Trading scan...")
+            
+            # Get top 10 candidates from full scan
+            top_10 = self.scanner.scan_for_momentum()
+            self.top_candidates = top_10
+            
+            # Send Telegram alerts for top candidates
+            if top_10:
+                # Send top 3 as immediate alerts
+                for stock in top_10[:3]:
+                    signal_type = "🚨 INSTANT REVERSAL ALERT" if stock['reversal'] else "🔭 MOMENTUM WATCH"
+                    
                     post_trade_entry(
-                        ticker=data['symbol'],
-                        side="WATCH",
-                        price=data['price'],
-                        signal=f"MOMENTUM DETECTED (RVOL: {data['rvol']}x)"
+                        ticker=stock['symbol'],
+                        side="BUY",
+                        price=stock['price'],
+                        signal=f"{signal_type} | RVOL: {stock['rvol']}x | Gap: {stock['pct_change']}% | Float: {stock['float']}M"
                     )
+                
+                # Send summary of top 10
+                summary = "📊 *TOP 10 WARRIOR SETUPS*\n━━━━━━━━━━━━━━━━━━━━\n"
+                for i, stock in enumerate(top_10[:10]):
+                    summary += f"{i+1}. *${stock['symbol']}* | {stock['pct_change']}% | RVOL: {stock['rvol']}x | Score: {stock['score']}\n"
+                
+                from telegram_poster import _send
+                _send(summary)
+                
+            else:
+                logger.info("No qualified candidates found in this scan")
+                
         else:
-            print("Outside trading hours. Resting...")
+            # Outside trading hours
+            pass
 
     def start(self):
+        """Start the scanner on 1-minute intervals"""
         self.scheduler.add_job(self.hunt_momentum, 'interval', minutes=1)
         self.scheduler.start()
-        logger.info("Vision Engine Started Successfully")
+        logger.info("🔥 Vision Warrior Trading Bot Started - Scanning 100+ stocks every minute")
