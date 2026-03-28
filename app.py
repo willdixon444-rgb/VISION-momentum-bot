@@ -14,12 +14,12 @@ logger = logging.getLogger("VISION")
 app = Flask(__name__)
 engine = VisionEngine()
 
-# Vision Dark-Mode UI (Merlin Architecture Inspired)
+# Vision Dark-Mode UI
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>VISION | Momentum</title>
+    <title>VISION | Warrior Trading Bot</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
     <style>
@@ -30,24 +30,47 @@ DASHBOARD_HTML = """
         .ticker { font-size: 1.4rem; font-weight: bold; color: #fff; }
         .pill { background: #18182e; padding: 4px 10px; border-radius: 4px; font-size: 0.8rem; margin-right: 5px; }
         .green { color: #22c55e; }
+        .red { color: #ef4444; }
     </style>
 </head>
 <body>
     <div class="status-bar">
-        <div><span class="glow">●</span> VISION LIVE</div>
-        <div id="clock">07:00:00 AM ET</div>
+        <div><span class="glow">●</span> VISION | Warrior Trading Bot</div>
+        <div id="clock"></div>
     </div>
-    <h2>Active Gappers (Top 100)</h2>
-    <div id="heatmap">
-        <div class="card">
-            <div class="ticker">$ASTS</div>
-            <div>
-                <span class="pill">RVOL: 12.4x</span>
-                <span class="pill">GAP: <span class="green">+18.2%</span></span>
-                <span class="pill">FLOAT: 14M</span>
-            </div>
-        </div>
+    <h2>🏆 Top 10 Momentum Stocks</h2>
+    <div id="top10">
+        <div class="card">Loading scanner data...</div>
     </div>
+    <script>
+        function updateDashboard() {
+            fetch('/api/top10')
+                .then(res => res.json())
+                .then(data => {
+                    if(data.candidates && data.candidates.length > 0) {
+                        let html = '';
+                        data.candidates.forEach((stock, i) => {
+                            html += `
+                                <div class="card">
+                                    <div class="ticker">${i+1}. $${stock.symbol}</div>
+                                    <div>
+                                        <span class="pill">💰 $${stock.price}</span>
+                                        <span class="pill ${stock.pct_change > 0 ? 'green' : 'red'}">Gap: ${stock.pct_change}%</span>
+                                        <span class="pill">📊 RVOL: ${stock.rvol}x</span>
+                                        <span class="pill">🪙 Float: ${stock.float}M</span>
+                                        <span class="pill">🚨 ${stock.reversal ? 'REVERSAL READY' : 'MOMENTUM'}</span>
+                                    </div>
+                                </div>
+                            `;
+                        });
+                        document.getElementById('top10').innerHTML = html;
+                    }
+                    document.getElementById('clock').innerText = new Date().toLocaleTimeString('en-US', {timeZone: 'America/New_York'});
+                });
+        }
+        updateDashboard();
+        setInterval(updateDashboard, 30000);
+    </script>
 </body>
 </html>
 """
@@ -58,16 +81,21 @@ def home():
 
 @app.route('/api/status')
 def status():
-    """Target for your Anytimer/UptimeRobot ping"""
     return jsonify({
         "status": "online",
-        "bot": "Vision Momentum",
+        "bot": "Vision Warrior Trading Bot",
         "uptime_sync": datetime.now().isoformat(),
-        "engine_active": engine.scheduler.running
+        "engine_active": engine.scheduler.running if engine.scheduler else False
+    })
+
+@app.route('/api/top10')
+def get_top10():
+    """Returns the current top 10 ranked candidates"""
+    return jsonify({
+        "candidates": engine.top_candidates if hasattr(engine, 'top_candidates') else []
     })
 
 if __name__ == "__main__":
-    # Start the background hunter before the web server
     engine.start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
