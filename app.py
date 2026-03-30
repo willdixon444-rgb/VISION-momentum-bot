@@ -10,6 +10,7 @@ logger = logging.getLogger("VISION")
 
 app = Flask(__name__)
 engine = VisionEngine()
+engine.start()
 
 # Vision Dark-Mode UI
 DASHBOARD_HTML = """
@@ -84,6 +85,9 @@ DASHBOARD_HTML = """
         }
         updateDashboard();
         setInterval(updateDashboard, 30000);
+        setInterval(() => {
+            document.getElementById('clock').innerText = new Date().toLocaleTimeString('en-US', {timeZone: 'America/New_York'});
+        }, 1000);
     </script>
 </body>
 </html>
@@ -111,14 +115,18 @@ def get_top10():
 
 @app.route('/api/test_scan')
 def test_scan():
-    """Manual test endpoint to force a scan (weekend testing only)"""
+    """Manual test endpoint to force a scan"""
     try:
         engine.hunt_momentum()
-        return jsonify({"status": "success", "message": "Manual scan triggered. Check Telegram for alerts."})
+        count = len(engine.top_candidates)
+        return jsonify({
+            "status": "success",
+            "message": f"Scan complete. Found {count} qualified stocks. Check Telegram for alerts."
+        })
     except Exception as e:
+        logger.error(f"Test scan error: {e}")
         return jsonify({"status": "error", "message": str(e)})
 
 if __name__ == "__main__":
-    engine.start()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
