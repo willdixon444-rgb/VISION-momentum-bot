@@ -1,16 +1,13 @@
 """
-VISION Scanner v7 — Ross Cameron 5 Pillar Methodology
+VISION Scanner v8 — Ross Cameron 5 Pillar Methodology
 ======================================================
-Pillar 1: RVOL >= 5x (vs 30-day average)
-Pillar 2: Up 10%+ from previous close (gap from prev close, not open)
-Pillar 3: News catalyst today
-Pillar 4: Price $1–$20
-Pillar 5: Float <= 10M shares (under 5M = priority)
+Fix from v7: RVOL was returning 0 for all stocks because Finnhub daily
+candles don't return data for many small/micro-cap tickers on free tier.
 
-Key change from v6: No static watchlist.
-We dynamically pull top gainers from Finviz every scan cycle,
-just like Ross's scanner does — finding ANY stock in the market
-that is gapping up hard today, regardless of name.
+v8 fix: Use Finnhub's /stock/metric endpoint which returns
+'10DayAverageTradingVolume' and '3MonthAverageTradingVolume' — these
+work reliably on free tier. Compare today's volume (from quote) against
+that average to get accurate RVOL.
 """
 
 import pandas as pd
@@ -19,18 +16,11 @@ import requests
 import os
 import logging
 import time
-from datetime import datetime, date
+from datetime import date
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger("VISION_SCANNER")
 
-# Finviz screener URL — Ross Cameron 5 Pillar filters baked in:
-# - Price $1-$20 (ta_highlow20_a0to5 = within 0-5% of 20-day high, not needed)
-# - Gap up 5%+ from prev close (gap_u5 = gap up 5%+)
-# - Float under 10M (sh_float_u10 = float under 10M)
-# - Price between $1 and $20 (sh_price_1to20)
-# - Exchange: NYSE + NASDAQ only (exch_nasd + exch_nyse handled by default)
-# - Sorted by % change descending (-change)
 FINVIZ_URL = (
     "https://finviz.com/screener.ashx"
     "?v=111"
@@ -51,24 +41,19 @@ HEADERS = {
 
 class VisionRossScanner:
     def __init__(self):
-        # Ross Cameron 5 Pillars — exact criteria
-        self.MIN_RVOL       = 5.0        # Pillar 1: 5x relative volume
-        self.MIN_GAP        = 10.0       # Pillar 2: up 10%+ from prev close
-        self.MIN_PRICE      = 1.0        # Pillar 4
-        self.MAX_PRICE      = 20.0       # Pillar 4
-        self.MAX_FLOAT_M    = 10.0       # Pillar 5: under 10M shares (in millions)
-        self.finnhub_key    = os.environ.get("FINNHUB_API_KEY", "")
+        self.MIN_RVOL    = 5.0
+        self.MIN_GAP     = 10.0
+        self.MIN_PRICE   = 1.0
+        self.MAX_PRICE   = 20.0
+        self.MAX_FLOAT_M = 10.0
+        self.finnhub_key = os.environ.get("FINNHUB_API_KEY", "")
 
     # ------------------------------------------------------------------ #
-    #  STEP 1 — Get dynamic universe from Finviz                          #
+    #  Finviz — dynamic universe                                          #
     # ------------------------------------------------------------------ #
 
     def get_top_gainers_finviz(self):
-        """
-        Scrape Finviz screener for top gaining small-cap low-float stocks.
-        Returns list of dicts: [{symbol, price, change_pct, float_m, volume}, ...]
-        This is the equivalent of Ross's 'Top Gappers' list each morning.
-        """
+        """Pull top gaining low-float small caps from Finviz screener."""
         results = []
         try:
             resp = requests.get(FINVIZ_URL, headers=HEADERS, timeout=15)
@@ -78,79 +63,56 @@ class VisionRossScanner:
 
             soup = BeautifulSoup(resp.text, "html.parser")
 
-            # Find the screener results table
-            table = soup.find("table", {"id": "screener-views-table"})
-            if not table:
-                # Try alternate table class used by Finviz
-                table = soup.find("table", class_="table-light")
-            if not table:
-                tables = soup.find_all("table")
-                # The data table is usually the largest one
-                table = max(tables, key=lambda t: len(t.find_all("tr")), default=None)
+            # Find all ticker links — most reliable way to extract tickers
+            ticker_links = soup.select("a.screener-link-primary")
+            if not ticker_links:
+                ticker_links = soup.select("td a[href*='quote.ashx']")
 
-            if not table:
-                logger.warning("Could not find Finviz results table")
-                return results
+            seen = set()
+            for link in ticker_links:
+                ticker = link.get_text(strip=True)
+                if not ticker or len(ticker) > 6 or ticker in seen:
+                    continue
+                seen.add(ticker)
 
-            rows = table.find_all("tr")
-            if len(rows) < 2:
-                logger.warning("Finviz table has no data rows")
-                return results
+                # Walk up to the row to get price/change
+                row = link.find_parent("tr")
+                if not row:
+                    results.append({"symbol": ticker, "price": 0, "change_pct": 0, "volume": 0})
+                    continue
 
-            # Parse header to find column indices
-            header_row = rows[0]
-            headers = [th.get_text(strip=True) for th in header_row.find_all("td")]
-            if not headers:
-                headers = [th.get_text(strip=True) for th in header_row.find_all("th")]
-
-            # Column name mappings
-            col_map = {}
-            for i, h in enumerate(headers):
-                h_lower = h.lower()
-                if h_lower == "ticker":
-                    col_map["ticker"] = i
-                elif h_lower == "price":
-                    col_map["price"] = i
-                elif "change" in h_lower and "%" not in h_lower:
-                    col_map["change"] = i
-                elif h_lower in ("change", "chg"):
-                    col_map["change"] = i
-                elif "volume" in h_lower and "rel" not in h_lower:
-                    col_map["volume"] = i
-                elif "float" in h_lower:
-                    col_map["float"] = i
-
-            logger.info(f"Finviz columns found: {col_map}")
-
-            for row in rows[1:]:
                 cells = row.find_all("td")
-                if len(cells) < 3:
-                    continue
-                try:
-                    # Ticker is usually in a link
-                    ticker_cell = cells[col_map.get("ticker", 1)]
-                    ticker = ticker_cell.get_text(strip=True)
-                    if not ticker or len(ticker) > 6:
-                        continue
+                cell_texts = [c.get_text(strip=True) for c in cells]
 
-                    price_text = cells[col_map.get("price", 8)].get_text(strip=True)
-                    change_text = cells[col_map.get("change", 9)].get_text(strip=True)
-                    volume_text = cells[col_map.get("volume", 10)].get_text(strip=True)
+                price = 0.0
+                change_pct = 0.0
+                volume = 0
 
-                    price = float(price_text.replace(",", "").replace("$", "")) if price_text else 0
-                    change_pct = float(change_text.replace("%", "").replace(",", "")) if change_text else 0
-                    volume = self._parse_volume(volume_text)
+                for text in cell_texts:
+                    # Price: looks like "3.45"
+                    if price == 0:
+                        try:
+                            v = float(text.replace(",", "").replace("$", ""))
+                            if 0.5 < v < 25:
+                                price = v
+                        except Exception:
+                            pass
+                    # Change: looks like "15.23%"
+                    if "%" in text and change_pct == 0:
+                        try:
+                            change_pct = float(text.replace("%", "").replace(",", ""))
+                        except Exception:
+                            pass
+                    # Volume: looks like "1.2M" or "500K"
+                    if volume == 0 and ("M" in text or "K" in text):
+                        volume = self._parse_volume(text)
 
-                    if price > 0 and ticker:
-                        results.append({
-                            "symbol":     ticker,
-                            "price":      price,
-                            "change_pct": change_pct,
-                            "volume":     volume,
-                        })
-                except Exception as e:
-                    logger.debug(f"Row parse error: {e}")
-                    continue
+                results.append({
+                    "symbol":     ticker,
+                    "price":      price,
+                    "change_pct": change_pct,
+                    "volume":     volume,
+                })
 
         except Exception as e:
             logger.warning(f"Finviz fetch error: {e}")
@@ -159,7 +121,6 @@ class VisionRossScanner:
         return results
 
     def _parse_volume(self, vol_str):
-        """Parse volume strings like '1.2M', '500K' into integers"""
         try:
             vol_str = vol_str.replace(",", "").strip()
             if "M" in vol_str:
@@ -172,7 +133,7 @@ class VisionRossScanner:
             return 0
 
     # ------------------------------------------------------------------ #
-    #  STEP 2 — Finnhub enrichment: RVOL + candles                       #
+    #  Finnhub helpers                                                    #
     # ------------------------------------------------------------------ #
 
     def _finnhub_get(self, endpoint, params=None):
@@ -191,11 +152,47 @@ class VisionRossScanner:
                 time.sleep(10)
             return None
         except Exception as e:
-            logger.warning(f"Finnhub error [{endpoint}]: {e}")
+            logger.warning(f"Finnhub [{endpoint}] error: {e}")
             return None
 
+    def calculate_rvol(self, symbol, today_volume):
+        """
+        RVOL = today's volume / 10-day average volume.
+        Uses Finnhub /stock/metric which reliably returns avg volume
+        even for small caps on free tier.
+        Falls back to intraday volume ratio if metric unavailable.
+        """
+        # Primary: use Finnhub basic metrics
+        data = self._finnhub_get("stock/metric", {"symbol": symbol, "metric": "all"})
+        time.sleep(0.15)
+
+        if data and data.get("metric"):
+            m = data["metric"]
+            # Try 10-day avg first, then 3-month avg
+            avg_vol = m.get("10DayAverageTradingVolume") or m.get("3MonthAverageTradingVolume")
+            if avg_vol and avg_vol > 0:
+                # avg_vol from Finnhub is in millions — convert
+                avg_vol_shares = avg_vol * 1_000_000
+                rvol = today_volume / avg_vol_shares if avg_vol_shares > 0 else 0
+                logger.info(f"  {symbol} RVOL: {rvol:.1f}x (today:{today_volume:,} / avg:{avg_vol_shares:,.0f})")
+                return round(rvol, 1)
+
+        # Fallback: use Finnhub quote which has today's volume
+        quote = self._finnhub_get("quote", {"symbol": symbol})
+        time.sleep(0.15)
+        if quote and quote.get("v") and quote.get("av"):
+            today_vol = quote["v"]    # current volume
+            avg_vol   = quote["av"]   # average volume
+            if avg_vol > 0:
+                rvol = today_vol / avg_vol
+                logger.info(f"  {symbol} RVOL (quote fallback): {rvol:.1f}x")
+                return round(rvol, 1)
+
+        logger.info(f"  {symbol} RVOL: could not calculate")
+        return 0
+
     def get_candles(self, symbol, resolution="5", count=80):
-        """Get intraday 5-min candles from Finnhub"""
+        """Get intraday 5-min candles for reversal detection."""
         now = int(time.time())
         lookback = count * int(resolution) * 60 * 2
         data = self._finnhub_get("stock/candle", {
@@ -207,59 +204,18 @@ class VisionRossScanner:
         if not data or data.get("s") != "ok":
             return None
         try:
-            df = pd.DataFrame({
+            return pd.DataFrame({
                 "Open":   data["o"],
                 "High":   data["h"],
                 "Low":    data["l"],
                 "Close":  data["c"],
                 "Volume": data["v"],
             })
-            return df
         except Exception:
             return None
-
-    def get_daily_candles(self, symbol, days=35):
-        """Get ~35 days of daily candles to calculate 30-day avg volume"""
-        now = int(time.time())
-        from_ts = now - (days * 86400)
-        data = self._finnhub_get("stock/candle", {
-            "symbol": symbol,
-            "resolution": "D",
-            "from": from_ts,
-            "to": now
-        })
-        if not data or data.get("s") != "ok":
-            return None
-        try:
-            return pd.DataFrame({
-                "Close":  data["c"],
-                "Volume": data["v"],
-            })
-        except Exception:
-            return None
-
-    def calculate_rvol(self, symbol):
-        """
-        Ross Cameron RVOL: today's volume vs 30-day average daily volume.
-        Returns float or 0 if data unavailable.
-        """
-        daily = self.get_daily_candles(symbol, days=35)
-        time.sleep(0.15)
-        if daily is None or len(daily) < 5:
-            return 0
-
-        # 30-day avg excludes today (last row)
-        avg_vol = daily["Volume"].iloc[:-1].tail(30).mean()
-        today_vol = daily["Volume"].iloc[-1]
-
-        return round(today_vol / avg_vol, 1) if avg_vol > 0 else 0
-
-    # ------------------------------------------------------------------ #
-    #  STEP 3 — News catalyst check (Pillar 3)                           #
-    # ------------------------------------------------------------------ #
 
     def has_news_today(self, symbol):
-        """Check if Finnhub has news for this stock today — Ross Pillar 3"""
+        """Check for news catalyst today — Ross Pillar 3."""
         today = date.today().strftime("%Y-%m-%d")
         data = self._finnhub_get("company-news", {
             "symbol": symbol,
@@ -267,14 +223,10 @@ class VisionRossScanner:
             "to": today
         })
         time.sleep(0.15)
-        if data and len(data) > 0:
+        has = bool(data and len(data) > 0)
+        if has:
             logger.info(f"  📰 {symbol} has {len(data)} news item(s) today")
-            return True
-        return False
-
-    # ------------------------------------------------------------------ #
-    #  STEP 4 — Reversal pattern detection                               #
-    # ------------------------------------------------------------------ #
+        return has
 
     def detect_reversal(self, df):
         if df is None or len(df) < 3:
@@ -289,72 +241,59 @@ class VisionRossScanner:
         return False
 
     # ------------------------------------------------------------------ #
-    #  MAIN SCAN                                                          #
+    #  Main scan                                                          #
     # ------------------------------------------------------------------ #
 
     def scan_for_momentum(self):
-        """
-        Ross Cameron 5 Pillar scan:
-        1. Pull dynamic universe from Finviz (top gaining small-cap low-float stocks)
-        2. Apply Pillar 2 filter: up 10%+ 
-        3. Enrich with Finnhub RVOL (Pillar 1: 5x)
-        4. Check news catalyst (Pillar 3)
-        5. Score and return top 10
-        """
-        logger.info("🔄 VISION v7 — Ross Cameron 5 Pillar scan starting...")
+        """Ross Cameron 5 Pillar scan."""
+        logger.info("🔄 VISION v8 — Ross Cameron 5 Pillar scan starting...")
 
-        # --- Step 1: Dynamic universe from Finviz ---
+        # Step 1: Dynamic universe from Finviz
         candidates_raw = self.get_top_gainers_finviz()
-
         if not candidates_raw:
-            logger.warning("⚠️ Finviz returned no results — market may be closed or blocked")
+            logger.warning("⚠️ Finviz returned no results")
             return []
 
-        # --- Step 2: Quick filters (price, gap) ---
+        # Step 2: Quick price + gap filter
         filtered = []
         for s in candidates_raw:
             if s["price"] < self.MIN_PRICE or s["price"] > self.MAX_PRICE:
-                logger.debug(f"  {s['symbol']} ❌ price ${s['price']}")
                 continue
             if s["change_pct"] < self.MIN_GAP:
-                logger.debug(f"  {s['symbol']} ❌ change {s['change_pct']:.1f}% (need {self.MIN_GAP}%+)")
                 continue
             filtered.append(s)
-            logger.info(f"  {s['symbol']} ✓ price ${s['price']} | up {s['change_pct']:.1f}%")
+            logger.info(f"  {s['symbol']} ✓ ${s['price']} | +{s['change_pct']:.1f}%")
 
         logger.info(f"📊 {len(filtered)} stocks passed price/gap filters")
-
         if not filtered:
             logger.info("No stocks passed initial filters — market may be slow today")
             return []
 
-        # --- Step 3: Enrich with Finnhub (RVOL + news) ---
+        # Step 3: Enrich with Finnhub
         qualified = []
-
-        for s in filtered[:20]:  # Cap at 20 to stay within Finnhub rate limits
+        for s in filtered[:20]:
             symbol = s["symbol"]
-            logger.info(f"  🔍 Checking {symbol}...")
+            logger.info(f"  🔍 Enriching {symbol}...")
 
-            # Pillar 1: RVOL
-            rvol = self.calculate_rvol(symbol)
+            # Pillar 1: RVOL (use Finviz volume as today's volume seed)
+            rvol = self.calculate_rvol(symbol, s.get("volume", 0))
             if rvol < self.MIN_RVOL:
                 logger.info(f"  {symbol} ❌ RVOL {rvol}x (need {self.MIN_RVOL}x)")
                 continue
 
-            # Pillar 3: News catalyst
+            # Pillar 3: News
             has_news = self.has_news_today(symbol)
 
-            # Intraday candles for reversal detection
+            # Reversal pattern
             df = self.get_candles(symbol)
             time.sleep(0.15)
             reversal = self.detect_reversal(df)
 
-            # Scoring — weighted by Ross's priorities
-            score = 0
-            score += min(rvol / self.MIN_RVOL, 4) * 35        # RVOL: up to 140 pts
-            score += min(s["change_pct"] / 10, 3) * 25        # Gap: up to 75 pts
-            score += 30 if has_news else 0                     # News catalyst bonus
-            score += 20 if reversal else 0                     # Reversal pattern bonus
+            # Score
+            score  = min(rvol / self.MIN_RVOL, 4) * 35
+            score += min(s["change_pct"] / 10, 3) * 25
+            score += 30 if has_news else 0
+            score += 20 if reversal else 0
 
             qualified.append({
                 "symbol":     symbol,
@@ -367,9 +306,8 @@ class VisionRossScanner:
                 "score":      round(score, 0)
             })
             logger.info(
-                f"  ✅ {symbol} QUALIFIED | Gap:{s['change_pct']:.1f}% | "
-                f"RVOL:{rvol}x | News:{'YES' if has_news else 'no'} | "
-                f"Reversal:{'YES' if reversal else 'no'} | Score:{score:.0f}"
+                f"  ✅ {symbol} QUALIFIED | +{s['change_pct']:.1f}% | "
+                f"RVOL:{rvol}x | News:{'YES' if has_news else 'no'} | Score:{score:.0f}"
             )
 
         qualified.sort(key=lambda x: x["score"], reverse=True)
@@ -378,8 +316,7 @@ class VisionRossScanner:
         logger.info(f"🎯 Scan complete — {len(qualified)} qualified, top {len(top_10)} selected")
         for i, s in enumerate(top_10):
             logger.info(
-                f"  {i+1}. ${s['symbol']} | {s['pct_change']}% | "
+                f"  {i+1}. ${s['symbol']} | +{s['pct_change']}% | "
                 f"RVOL:{s['rvol']}x | News:{'✓' if s['has_news'] else '✗'} | Score:{s['score']}"
             )
-
         return top_10
