@@ -5,6 +5,7 @@ from datetime import datetime
 import requests
 import os
 import logging
+import time
 
 logger = logging.getLogger("VISION_SCANNER")
 
@@ -52,6 +53,39 @@ class VisionRossScanner:
 
         return gappers
 
+    def fetch_batch_history(self, symbols):
+        """
+        Fetch 1-day 5-min history for multiple symbols in one yfinance call.
+        Returns a dict of {symbol: DataFrame}.
+        Batching is far more efficient than one call per symbol.
+        """
+        try:
+            raw = yf.download(
+                tickers=" ".join(symbols),
+                period="1d",
+                interval="5m",
+                group_by="ticker",
+                auto_adjust=True,
+                progress=False,
+                threads=True
+            )
+            result = {}
+            for sym in symbols:
+                try:
+                    if len(symbols) == 1:
+                        df = raw.copy()
+                    else:
+                        df = raw[sym].copy()
+                    df = df.dropna(how='all')
+                    if not df.empty:
+                        result[sym] = df
+                except Exception:
+                    pass
+            return result
+        except Exception as e:
+            logger.warning(f"Batch fetch error: {e}")
+            return {}
+
     def get_float(self, symbol):
         """Gets float shares from yfinance"""
         try:
@@ -71,7 +105,7 @@ class VisionRossScanner:
         return current_vol / avg_vol if avg_vol > 0 else 0
 
     def calculate_adx(self, df, period=14):
-        """Calculate ADX (Average Directional Index) manually"""
+        """Calculate ADX manually"""
         try:
             high = df['High']
             low = df['Low']
@@ -107,11 +141,9 @@ class VisionRossScanner:
         last_candle = df.iloc[-1]
         prev_candle = df.iloc[-2]
 
-        # Bullish reversal: price breaks above previous high with volume spike
         if last_candle['Close'] > prev_candle['High'] and last_candle['Volume'] > prev_candle['Volume'] * 1.5:
             return True
 
-        # V-shaped reversal: strong bounce off low
         if len(df) > 10:
             low_5min = df['Low'].iloc[-10:].min()
             if last_candle['Low'] <= low_5min * 1.01 and last_candle['Close'] > last_candle['Open'] * 1.02:
@@ -122,24 +154,33 @@ class VisionRossScanner:
     def scan_for_momentum(self):
         """
         Complete Warrior Trading scan:
-        - Scans 100+ gap-up stocks
+        - Fetches price data in batches to avoid rate limits
         - Filters by RVOL, Float, Price, Gap %
         - Returns top 10 ranked candidates
         """
         logger.info("🔄 Scanning stocks for Warrior Trading setup...")
 
         gappers = self.fetch_top_gappers()
-        logger.info(f"📊 Scanning {len(gappers)} stocks")
+        symbols = [s['symbol'] for s in gappers[:50]]  # Cap at 50 to stay under rate limits
+        gap_map = {s['symbol']: s.get('gap', 0) for s in gappers}
+
+        logger.info(f"📊 Fetching data for {len(symbols)} stocks in batches of 10...")
+
+        # Fetch all price data in batches — avoids per-symbol rate limiting
+        all_data = {}
+        batch_size = 10
+        for i in range(0, len(symbols), batch_size):
+            batch = symbols[i:i + batch_size]
+            batch_data = self.fetch_batch_history(batch)
+            all_data.update(batch_data)
+            time.sleep(1)  # 1 second between batches
+
+        logger.info(f"✅ Got price data for {len(all_data)} symbols")
 
         candidates = []
 
-        for stock in gappers[:150]:
-            symbol = stock['symbol']
-
+        for symbol, df in all_data.items():
             try:
-                ticker = yf.Ticker(symbol)
-                df = ticker.history(period="1d", interval="5m")
-
                 if df.empty or len(df) < 5:
                     continue
 
@@ -148,8 +189,8 @@ class VisionRossScanner:
                 gap_pct = ((current_price - open_price) / open_price) * 100
 
                 # Use pre-calculated gap from Finnhub if available
-                if stock.get('gap', 0) > 0:
-                    gap_pct = stock['gap']
+                if gap_map.get(symbol, 0) > 0:
+                    gap_pct = gap_map[symbol]
 
                 # Price filter
                 if current_price < self.MIN_PRICE or current_price > self.MAX_PRICE:
@@ -159,14 +200,15 @@ class VisionRossScanner:
                 if gap_pct < self.MIN_GAP:
                     continue
 
-                # Float filter
-                float_millions = self.get_float(symbol)
-                if float_millions > self.MAX_FLOAT:
-                    continue
-
-                # RVOL filter
+                # RVOL filter (uses already-fetched data — no extra call)
                 rvol = self.calculate_rvol(df)
                 if rvol < self.MIN_RVOL:
+                    continue
+
+                # Float filter — only hits API for stocks that passed all other filters
+                float_millions = self.get_float(symbol)
+                time.sleep(0.3)  # Small delay for float calls
+                if float_millions > self.MAX_FLOAT:
                     continue
 
                 # Technical indicators
@@ -175,10 +217,10 @@ class VisionRossScanner:
 
                 # Scoring
                 score = 0
-                score += min(rvol / self.MIN_RVOL, 3) * 30      # RVOL: up to 90 pts
-                score += min(gap_pct / 5, 3) * 20               # Gap: up to 60 pts
-                score += max(0, (self.MAX_FLOAT - float_millions) / self.MAX_FLOAT) * 20  # Float: up to 20 pts
-                score += 30 if reversal else 10                  # Reversal bonus
+                score += min(rvol / self.MIN_RVOL, 3) * 30
+                score += min(gap_pct / 5, 3) * 20
+                score += max(0, (self.MAX_FLOAT - float_millions) / self.MAX_FLOAT) * 20
+                score += 30 if reversal else 10
 
                 candidates.append({
                     'symbol': symbol,
@@ -192,7 +234,7 @@ class VisionRossScanner:
                 })
 
             except Exception as e:
-                logger.warning(f"Error scanning {symbol}: {e}")
+                logger.warning(f"Error processing {symbol}: {e}")
                 continue
 
         candidates.sort(key=lambda x: x['score'], reverse=True)
