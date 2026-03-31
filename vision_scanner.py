@@ -1,13 +1,18 @@
 """
-VISION Scanner v10 — Ross Cameron 5 Pillar Methodology
+VISION Scanner v12 — Ross Cameron 5 Pillar Methodology
 =======================================================
-Fix from v9: Finviz blocks cloud server IPs (Render/AWS etc.)
-returning empty pages — same issue as Yahoo Finance.
+Universe discovery: Financial Modeling Prep (FMP)
+- /v3/gainers  → pre-market & morning gap-up stocks (Phase 1)
+- /v3/actives  → intraday high volume movers (Phase 2 HOD)
+Enrichment: Finnhub
+- RVOL, candles, news catalyst (same as before)
 
-v10 fix: Two-pronged approach:
-1. Better Finviz request with full session/cookies/headers
-2. Fallback to Finnhub's /stock/market-status + quote polling
-   of a curated small-cap universe if Finviz is still blocked
+FMP is a proper REST API — no scraping, no Cloudflare, works
+perfectly from Render cloud servers.
+
+Two-phase approach matching Ross Cameron's actual workflow:
+Phase 1 (pre-market to 9:30 AM): Focus on gap-up stocks
+Phase 2 (9:30 AM onward): Focus on intraday HOD movers
 """
 
 import pandas as pd
@@ -16,54 +21,15 @@ import os
 import logging
 import time
 import re
-from datetime import date
-from bs4 import BeautifulSoup
+from datetime import date, datetime
+import pytz
 
 logger = logging.getLogger("VISION_SCANNER")
 
-# Finviz screener — low float <10M, price $1-$20, gap up 5%+, sorted by change
-FINVIZ_URL = (
-    "https://finviz.com/screener.ashx"
-    "?v=111"
-    "&f=sh_float_u10,sh_price_1to20,ta_changeopen_u5"
-    "&o=-change"
-    "&r=1"
-)
-
-# Realistic browser session headers
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/123.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;"
-        "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Cache-Control": "max-age=0",
-}
-
-# Valid ticker: 1-5 uppercase letters only
+# Valid ticker regex
 TICKER_RE = re.compile(r'^[A-Z]{1,5}$')
 
-# Fallback small-cap watchlist — used if Finviz is blocked
-# These are known frequent Ross Cameron-style movers
-FALLBACK_WATCHLIST = [
-    "ASTS", "QUBT", "LUNR", "RKLB", "AISP", "HOLO", "CECO", "MOBX",
-    "MARA", "RIOT", "CIFR", "HUT", "BITF", "BTBT",
-    "MULN", "LCID", "RIVN", "GOEV", "NKLA", "SOLO",
-    "OCGN", "HRTX", "SNDL", "MVIS", "ATER", "CLOV", "SPCE",
-    "HOOD", "OPEN", "FUBO", "FFIE", "GFAI", "KPLT",
-    "ABML", "IMPP", "PROG", "HYMC", "LMND", "PSFE"
-]
+FMP_BASE = "https://financialmodelingprep.com/api/v3"
 
 
 class VisionRossScanner:
@@ -72,66 +38,74 @@ class VisionRossScanner:
         self.MIN_GAP     = 10.0
         self.MIN_PRICE   = 1.0
         self.MAX_PRICE   = 20.0
+        self.fmp_key     = os.environ.get("FMP_API_KEY", "")
         self.finnhub_key = os.environ.get("FINNHUB_API_KEY", "")
-        self.session     = self._make_session()
-
-    def _make_session(self):
-        """Create a requests session that mimics a real browser."""
-        s = requests.Session()
-        s.headers.update(HEADERS)
-        # Warm up the session by hitting Finviz homepage first
-        try:
-            s.get("https://finviz.com", timeout=10)
-            time.sleep(1)
-        except Exception:
-            pass
-        return s
 
     # ------------------------------------------------------------------ #
-    #  Finviz — dynamic universe                                          #
+    #  FMP — universe discovery                                           #
     # ------------------------------------------------------------------ #
 
-    def get_top_gainers_finviz(self):
-        """
-        Scrape Finviz for top gaining low-float small caps.
-        Uses a warmed-up session with realistic browser headers
-        to avoid cloud IP blocking.
-        """
-        tickers = []
+    def _fmp_get(self, endpoint):
+        """Generic FMP API caller."""
+        if not self.fmp_key:
+            logger.error("FMP_API_KEY not set")
+            return None
+        url = f"{FMP_BASE}/{endpoint}?apikey={self.fmp_key}"
         try:
-            resp = self.session.get(FINVIZ_URL, timeout=15)
-            logger.info(f"Finviz status: {resp.status_code} | content length: {len(resp.text)}")
-
-            if resp.status_code != 200:
-                logger.warning(f"Finviz returned {resp.status_code}")
-                return tickers
-
-            soup = BeautifulSoup(resp.text, "html.parser")
-
-            # Primary: screener-link-primary class (ticker links)
-            links = soup.select("a.screener-link-primary")
-            logger.info(f"Finviz screener-link-primary found: {len(links)}")
-
-            if not links:
-                # Fallback: any link with quote.ashx in href
-                links = soup.select("a[href*='quote.ashx']")
-                logger.info(f"Finviz quote links found: {len(links)}")
-
-            seen = set()
-            for link in links:
-                ticker = link.get_text(strip=True)
-                if TICKER_RE.match(ticker) and ticker not in seen:
-                    seen.add(ticker)
-                    tickers.append(ticker)
-
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                return r.json()
+            elif r.status_code == 429:
+                logger.warning("FMP rate limit hit")
+            else:
+                logger.warning(f"FMP {endpoint} returned {r.status_code}")
+            return None
         except Exception as e:
-            logger.warning(f"Finviz fetch error: {e}")
+            logger.warning(f"FMP error [{endpoint}]: {e}")
+            return None
 
-        logger.info(f"📋 Finviz returned {len(tickers)} valid tickers: {tickers[:10]}")
-        return tickers
+    def get_fmp_gainers(self):
+        """
+        Phase 1: Top gaining stocks right now from FMP.
+        Returns list of symbols that are up big today.
+        """
+        data = self._fmp_get("gainers")
+        if not data:
+            return []
+        symbols = []
+        for item in data:
+            sym = item.get("ticker") or item.get("symbol", "")
+            if TICKER_RE.match(sym):
+                symbols.append({
+                    "symbol":     sym,
+                    "price":      float(item.get("price", 0)),
+                    "change_pct": float(item.get("changesPercentage", 0)),
+                })
+        logger.info(f"📈 FMP gainers returned {len(symbols)} stocks")
+        return symbols
+
+    def get_fmp_actives(self):
+        """
+        Phase 2: Most active stocks by volume from FMP.
+        Used after 9:30 AM to catch HOD intraday movers.
+        """
+        data = self._fmp_get("actives")
+        if not data:
+            return []
+        symbols = []
+        for item in data:
+            sym = item.get("ticker") or item.get("symbol", "")
+            if TICKER_RE.match(sym):
+                symbols.append({
+                    "symbol":     sym,
+                    "price":      float(item.get("price", 0)),
+                    "change_pct": float(item.get("changesPercentage", 0)),
+                })
+        logger.info(f"🔥 FMP actives returned {len(symbols)} stocks")
+        return symbols
 
     # ------------------------------------------------------------------ #
-    #  Finnhub helpers                                                    #
+    #  Finnhub — enrichment                                               #
     # ------------------------------------------------------------------ #
 
     def _finnhub_get(self, endpoint, params=None):
@@ -154,7 +128,7 @@ class VisionRossScanner:
             return None
 
     def get_quote(self, symbol):
-        """Get current price, change%, volume from Finnhub."""
+        """Finnhub quote for volume data."""
         data = self._finnhub_get("quote", {"symbol": symbol})
         time.sleep(0.15)
         if not data or data.get("c", 0) == 0:
@@ -162,16 +136,14 @@ class VisionRossScanner:
         return {
             "price":      data.get("c", 0),
             "prev_close": data.get("pc", 0),
-            "open":       data.get("o", 0),
             "volume":     data.get("v", 0),
             "avg_volume": data.get("av", 0),
         }
 
     def calculate_rvol(self, symbol, today_volume, avg_volume):
-        """RVOL using Finnhub /stock/metric 10-day avg volume."""
+        """RVOL using Finnhub 10-day avg volume metric."""
         data = self._finnhub_get("stock/metric", {"symbol": symbol, "metric": "all"})
         time.sleep(0.15)
-
         if data and data.get("metric"):
             m = data["metric"]
             avg_vol_m = m.get("10DayAverageTradingVolume") or m.get("3MonthAverageTradingVolume")
@@ -180,12 +152,10 @@ class VisionRossScanner:
                 rvol = today_volume / avg_vol_shares
                 logger.info(f"  {symbol} RVOL: {rvol:.1f}x (today:{today_volume:,} / 10d-avg:{avg_vol_shares:,.0f})")
                 return round(rvol, 1)
-
         if avg_volume and avg_volume > 0:
             rvol = today_volume / avg_volume
             logger.info(f"  {symbol} RVOL (quote fallback): {rvol:.1f}x")
             return round(rvol, 1)
-
         return 0
 
     def get_candles(self, symbol, resolution="5", count=80):
@@ -212,7 +182,7 @@ class VisionRossScanner:
             return None
 
     def has_news_today(self, symbol):
-        """Ross Pillar 3 — news catalyst check."""
+        """Ross Pillar 3 — news catalyst."""
         today = date.today().strftime("%Y-%m-%d")
         data = self._finnhub_get("company-news", {
             "symbol": symbol,
@@ -242,56 +212,78 @@ class VisionRossScanner:
     # ------------------------------------------------------------------ #
 
     def scan_for_momentum(self):
-        """Ross Cameron 5 Pillar scan."""
-        logger.info("🔄 VISION v10 — Ross Cameron 5 Pillar scan starting...")
+        """
+        Ross Cameron two-phase scan:
+        Phase 1 (before 9:30 AM ET): gainers = gap-up watchlist
+        Phase 2 (9:30 AM+ ET): actives = HOD intraday movers
+        Both phases then enriched with Finnhub RVOL + news
+        """
+        logger.info("🔄 VISION v12 — Ross Cameron 5 Pillar scan starting...")
 
-        # Step 1: Try Finviz for dynamic universe
-        tickers = self.get_top_gainers_finviz()
+        if not self.fmp_key:
+            logger.error("❌ FMP_API_KEY not set — cannot scan")
+            return []
 
-        # Step 2: Fall back to watchlist + Finnhub quotes if Finviz blocked
-        if not tickers:
-            logger.info("⚠️ Finviz blocked — using Finnhub quote scan on fallback watchlist")
-            tickers = FALLBACK_WATCHLIST
+        # Determine phase based on time
+        et = pytz.timezone("America/New_York")
+        now_et = datetime.now(et)
+        is_premarket = now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30)
 
-        # Step 3: Fetch quotes and apply price + gap filters
+        if is_premarket:
+            logger.info("📋 Phase 1 — Pre-market: fetching gap-up stocks from FMP")
+            universe = self.get_fmp_gainers()
+        else:
+            logger.info("📋 Phase 2 — Market hours: fetching top gainers + actives from FMP")
+            gainers = self.get_fmp_gainers()
+            actives = self.get_fmp_actives()
+            # Merge and deduplicate — gainers take priority
+            seen = set()
+            universe = []
+            for s in gainers + actives:
+                if s["symbol"] not in seen:
+                    seen.add(s["symbol"])
+                    universe.append(s)
+
+        if not universe:
+            logger.warning("⚠️ FMP returned no stocks")
+            return []
+
+        # Apply price + gap filters
         filtered = []
-        for symbol in tickers[:30]:
-            quote = self.get_quote(symbol)
-            if not quote:
-                continue
-
-            price = quote["price"]
-            prev_close = quote["prev_close"]
-            gap_pct = ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0
+        for s in universe:
+            price = s.get("price", 0)
+            gap = s.get("change_pct", 0)
 
             if price < self.MIN_PRICE or price > self.MAX_PRICE:
-                logger.debug(f"  {symbol} ❌ price ${price:.2f}")
+                logger.debug(f"  {s['symbol']} ❌ price ${price:.2f}")
                 continue
-            if gap_pct < self.MIN_GAP:
-                logger.debug(f"  {symbol} ❌ gap {gap_pct:.1f}%")
+            if gap < self.MIN_GAP:
+                logger.debug(f"  {s['symbol']} ❌ gap {gap:.1f}%")
                 continue
 
-            filtered.append({
-                "symbol":     symbol,
-                "price":      price,
-                "change_pct": round(gap_pct, 1),
-                "volume":     quote["volume"],
-                "avg_volume": quote["avg_volume"],
-            })
-            logger.info(f"  {symbol} ✓ ${price:.2f} | +{gap_pct:.1f}%")
+            filtered.append(s)
+            logger.info(f"  {s['symbol']} ✓ ${price:.2f} | +{gap:.1f}%")
 
         logger.info(f"📊 {len(filtered)} stocks passed price/gap filters")
         if not filtered:
             logger.info("No stocks passed filters — market may be slow today")
             return []
 
-        # Step 4: RVOL + news + reversal
+        # Enrich with Finnhub
         qualified = []
         for s in filtered[:20]:
             symbol = s["symbol"]
             logger.info(f"  🔍 Enriching {symbol}...")
 
-            rvol = self.calculate_rvol(symbol, s["volume"], s["avg_volume"])
+            # Get volume from Finnhub quote
+            quote = self.get_quote(symbol)
+            if not quote:
+                continue
+
+            today_vol = quote["volume"]
+            avg_vol   = quote["avg_volume"]
+
+            rvol = self.calculate_rvol(symbol, today_vol, avg_vol)
             if rvol < self.MIN_RVOL:
                 logger.info(f"  {symbol} ❌ RVOL {rvol}x (need {self.MIN_RVOL}x)")
                 continue
@@ -309,7 +301,7 @@ class VisionRossScanner:
             qualified.append({
                 "symbol":     symbol,
                 "price":      round(s["price"], 2),
-                "pct_change": s["change_pct"],
+                "pct_change": round(s["change_pct"], 1),
                 "rvol":       rvol,
                 "float":      0,
                 "has_news":   has_news,
@@ -317,7 +309,7 @@ class VisionRossScanner:
                 "score":      round(score, 0)
             })
             logger.info(
-                f"  ✅ {symbol} QUALIFIED | +{s['change_pct']}% | "
+                f"  ✅ {symbol} QUALIFIED | +{s['change_pct']:.1f}% | "
                 f"RVOL:{rvol}x | News:{'YES' if has_news else 'no'} | Score:{score:.0f}"
             )
 
