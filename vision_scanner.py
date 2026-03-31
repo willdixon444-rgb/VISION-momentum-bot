@@ -1,12 +1,13 @@
 """
-VISION Scanner v9 — Ross Cameron 5 Pillar Methodology
-======================================================
-Fix from v8: Finviz HTML parser was picking up cell values
-(volume, price, % change, country names) as ticker symbols.
+VISION Scanner v10 — Ross Cameron 5 Pillar Methodology
+=======================================================
+Fix from v9: Finviz blocks cloud server IPs (Render/AWS etc.)
+returning empty pages — same issue as Yahoo Finance.
 
-v9 fix: Only accept tickers from the specific Finviz ticker link
-element (screener-link-primary), then fetch price/change/volume
-from Finnhub quote directly — bypassing the fragile row parsing.
+v10 fix: Two-pronged approach:
+1. Better Finviz request with full session/cookies/headers
+2. Fallback to Finnhub's /stock/market-status + quote polling
+   of a curated small-cap universe if Finviz is still blocked
 """
 
 import pandas as pd
@@ -20,6 +21,7 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger("VISION_SCANNER")
 
+# Finviz screener — low float <10M, price $1-$20, gap up 5%+, sorted by change
 FINVIZ_URL = (
     "https://finviz.com/screener.ashx"
     "?v=111"
@@ -28,17 +30,40 @@ FINVIZ_URL = (
     "&r=1"
 )
 
+# Realistic browser session headers
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Chrome/123.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
     ),
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Cache-Control": "max-age=0",
 }
 
-# Valid ticker: 1-5 uppercase letters only, no numbers/symbols
+# Valid ticker: 1-5 uppercase letters only
 TICKER_RE = re.compile(r'^[A-Z]{1,5}$')
+
+# Fallback small-cap watchlist — used if Finviz is blocked
+# These are known frequent Ross Cameron-style movers
+FALLBACK_WATCHLIST = [
+    "ASTS", "QUBT", "LUNR", "RKLB", "AISP", "HOLO", "CECO", "MOBX",
+    "MARA", "RIOT", "CIFR", "HUT", "BITF", "BTBT",
+    "MULN", "LCID", "RIVN", "GOEV", "NKLA", "SOLO",
+    "OCGN", "HRTX", "SNDL", "MVIS", "ATER", "CLOV", "SPCE",
+    "HOOD", "OPEN", "FUBO", "FFIE", "GFAI", "KPLT",
+    "ABML", "IMPP", "PROG", "HYMC", "LMND", "PSFE"
+]
 
 
 class VisionRossScanner:
@@ -48,43 +73,56 @@ class VisionRossScanner:
         self.MIN_PRICE   = 1.0
         self.MAX_PRICE   = 20.0
         self.finnhub_key = os.environ.get("FINNHUB_API_KEY", "")
+        self.session     = self._make_session()
+
+    def _make_session(self):
+        """Create a requests session that mimics a real browser."""
+        s = requests.Session()
+        s.headers.update(HEADERS)
+        # Warm up the session by hitting Finviz homepage first
+        try:
+            s.get("https://finviz.com", timeout=10)
+            time.sleep(1)
+        except Exception:
+            pass
+        return s
 
     # ------------------------------------------------------------------ #
-    #  Finviz — get ticker symbols only                                   #
+    #  Finviz — dynamic universe                                          #
     # ------------------------------------------------------------------ #
 
     def get_top_gainers_finviz(self):
         """
-        Extract only valid ticker symbols from Finviz screener.
-        Price/change/volume are fetched from Finnhub quote — avoids
-        the junk values that come from parsing the HTML table rows.
+        Scrape Finviz for top gaining low-float small caps.
+        Uses a warmed-up session with realistic browser headers
+        to avoid cloud IP blocking.
         """
         tickers = []
         try:
-            resp = requests.get(FINVIZ_URL, headers=HEADERS, timeout=15)
+            resp = self.session.get(FINVIZ_URL, timeout=15)
+            logger.info(f"Finviz status: {resp.status_code} | content length: {len(resp.text)}")
+
             if resp.status_code != 200:
                 logger.warning(f"Finviz returned {resp.status_code}")
                 return tickers
 
             soup = BeautifulSoup(resp.text, "html.parser")
 
-            # Finviz ticker links always use class 'screener-link-primary'
+            # Primary: screener-link-primary class (ticker links)
             links = soup.select("a.screener-link-primary")
+            logger.info(f"Finviz screener-link-primary found: {len(links)}")
 
+            if not links:
+                # Fallback: any link with quote.ashx in href
+                links = soup.select("a[href*='quote.ashx']")
+                logger.info(f"Finviz quote links found: {len(links)}")
+
+            seen = set()
             for link in links:
                 ticker = link.get_text(strip=True)
-                # Strict validation: uppercase letters only, 1-5 chars
-                if TICKER_RE.match(ticker):
+                if TICKER_RE.match(ticker) and ticker not in seen:
+                    seen.add(ticker)
                     tickers.append(ticker)
-
-            # Deduplicate while preserving order
-            seen = set()
-            unique = []
-            for t in tickers:
-                if t not in seen:
-                    seen.add(t)
-                    unique.append(t)
-            tickers = unique
 
         except Exception as e:
             logger.warning(f"Finviz fetch error: {e}")
@@ -116,7 +154,7 @@ class VisionRossScanner:
             return None
 
     def get_quote(self, symbol):
-        """Get current price, change%, and volume from Finnhub quote."""
+        """Get current price, change%, volume from Finnhub."""
         data = self._finnhub_get("quote", {"symbol": symbol})
         time.sleep(0.15)
         if not data or data.get("c", 0) == 0:
@@ -130,10 +168,7 @@ class VisionRossScanner:
         }
 
     def calculate_rvol(self, symbol, today_volume, avg_volume):
-        """
-        RVOL using Finnhub /stock/metric for 10-day avg volume.
-        Falls back to quote avg_volume if metric unavailable.
-        """
+        """RVOL using Finnhub /stock/metric 10-day avg volume."""
         data = self._finnhub_get("stock/metric", {"symbol": symbol, "metric": "all"})
         time.sleep(0.15)
 
@@ -146,13 +181,11 @@ class VisionRossScanner:
                 logger.info(f"  {symbol} RVOL: {rvol:.1f}x (today:{today_volume:,} / 10d-avg:{avg_vol_shares:,.0f})")
                 return round(rvol, 1)
 
-        # Fallback to quote avg volume
         if avg_volume and avg_volume > 0:
             rvol = today_volume / avg_volume
             logger.info(f"  {symbol} RVOL (quote fallback): {rvol:.1f}x")
             return round(rvol, 1)
 
-        logger.info(f"  {symbol} RVOL: could not calculate")
         return 0
 
     def get_candles(self, symbol, resolution="5", count=80):
@@ -210,15 +243,17 @@ class VisionRossScanner:
 
     def scan_for_momentum(self):
         """Ross Cameron 5 Pillar scan."""
-        logger.info("🔄 VISION v9 — Ross Cameron 5 Pillar scan starting...")
+        logger.info("🔄 VISION v10 — Ross Cameron 5 Pillar scan starting...")
 
-        # Step 1: Clean ticker list from Finviz
+        # Step 1: Try Finviz for dynamic universe
         tickers = self.get_top_gainers_finviz()
-        if not tickers:
-            logger.warning("⚠️ Finviz returned no tickers")
-            return []
 
-        # Step 2: Fetch quote for each ticker, apply price + gap filters
+        # Step 2: Fall back to watchlist + Finnhub quotes if Finviz blocked
+        if not tickers:
+            logger.info("⚠️ Finviz blocked — using Finnhub quote scan on fallback watchlist")
+            tickers = FALLBACK_WATCHLIST
+
+        # Step 3: Fetch quotes and apply price + gap filters
         filtered = []
         for symbol in tickers[:30]:
             quote = self.get_quote(symbol)
@@ -250,7 +285,7 @@ class VisionRossScanner:
             logger.info("No stocks passed filters — market may be slow today")
             return []
 
-        # Step 3: RVOL + news + reversal
+        # Step 4: RVOL + news + reversal
         qualified = []
         for s in filtered[:20]:
             symbol = s["symbol"]
@@ -262,7 +297,6 @@ class VisionRossScanner:
                 continue
 
             has_news = self.has_news_today(symbol)
-
             df = self.get_candles(symbol)
             time.sleep(0.15)
             reversal = self.detect_reversal(df)
@@ -277,6 +311,7 @@ class VisionRossScanner:
                 "price":      round(s["price"], 2),
                 "pct_change": s["change_pct"],
                 "rvol":       rvol,
+                "float":      0,
                 "has_news":   has_news,
                 "reversal":   reversal,
                 "score":      round(score, 0)
