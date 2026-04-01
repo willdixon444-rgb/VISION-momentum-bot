@@ -1,18 +1,13 @@
 """
-VISION Scanner v12 — Ross Cameron 5 Pillar Methodology
+VISION Scanner v13 — Ross Cameron 5 Pillar Methodology
 =======================================================
-Universe discovery: Financial Modeling Prep (FMP)
-- /v3/gainers  → pre-market & morning gap-up stocks (Phase 1)
-- /v3/actives  → intraday high volume movers (Phase 2 HOD)
+Universe discovery: Alpaca Market Movers API (free, cloud-friendly)
+- /v1beta1/screener/stocks/movers → top gaining stocks right now
 Enrichment: Finnhub
-- RVOL, candles, news catalyst (same as before)
+- RVOL, candles, news catalyst
 
-FMP is a proper REST API — no scraping, no Cloudflare, works
-perfectly from Render cloud servers.
-
-Two-phase approach matching Ross Cameron's actual workflow:
-Phase 1 (pre-market to 9:30 AM): Focus on gap-up stocks
-Phase 2 (9:30 AM onward): Focus on intraday HOD movers
+Alpaca is a proper REST API — no scraping, no Cloudflare,
+works perfectly from Render cloud servers.
 """
 
 import pandas as pd
@@ -26,83 +21,70 @@ import pytz
 
 logger = logging.getLogger("VISION_SCANNER")
 
-# Valid ticker regex
 TICKER_RE = re.compile(r'^[A-Z]{1,5}$')
 
-FMP_BASE = "https://financialmodelingprep.com/api/v3"
+# Alpaca paper trading base URL
+ALPACA_BASE = "https://paper-api.alpaca.markets/v2"
+ALPACA_DATA_BASE = "https://data.alpaca.markets"
 
 
 class VisionRossScanner:
     def __init__(self):
-        self.MIN_RVOL    = 5.0
-        self.MIN_GAP     = 10.0
-        self.MIN_PRICE   = 1.0
-        self.MAX_PRICE   = 20.0
-        self.fmp_key     = os.environ.get("FMP_API_KEY", "")
-        self.finnhub_key = os.environ.get("FINNHUB_API_KEY", "")
+        self.MIN_RVOL      = 5.0
+        self.MIN_GAP       = 10.0
+        self.MIN_PRICE     = 1.0
+        self.MAX_PRICE     = 20.0
+        self.alpaca_key    = os.environ.get("ALPACA_API_KEY", "")
+        self.alpaca_secret = os.environ.get("ALPACA_SECRET_KEY", "")
+        self.finnhub_key   = os.environ.get("FINNHUB_API_KEY", "")
 
     # ------------------------------------------------------------------ #
-    #  FMP — universe discovery                                           #
+    #  Alpaca — universe discovery                                        #
     # ------------------------------------------------------------------ #
 
-    def _fmp_get(self, endpoint):
-        """Generic FMP API caller."""
-        if not self.fmp_key:
-            logger.error("FMP_API_KEY not set")
-            return None
-        url = f"{FMP_BASE}/{endpoint}?apikey={self.fmp_key}"
+    def _alpaca_headers(self):
+        return {
+            "APCA-API-KEY-ID":     self.alpaca_key,
+            "APCA-API-SECRET-KEY": self.alpaca_secret,
+            "Accept": "application/json"
+        }
+
+    def get_alpaca_movers(self):
+        """
+        Get top gaining stocks from Alpaca's market movers endpoint.
+        Returns list of {symbol, price, change_pct}
+        Free with any Alpaca account — works from cloud servers.
+        """
+        if not self.alpaca_key or not self.alpaca_secret:
+            logger.error("❌ ALPACA_API_KEY or ALPACA_SECRET_KEY not set")
+            return []
+
         try:
-            r = requests.get(url, timeout=10)
+            url = f"{ALPACA_DATA_BASE}/v1beta1/screener/stocks/movers"
+            params = {"top": 50}
+            r = requests.get(url, headers=self._alpaca_headers(), params=params, timeout=10)
+
             if r.status_code == 200:
-                return r.json()
-            elif r.status_code == 429:
-                logger.warning("FMP rate limit hit")
+                data = r.json()
+                gainers = data.get("gainers", [])
+                results = []
+                for item in gainers:
+                    sym = item.get("symbol", "")
+                    if TICKER_RE.match(sym):
+                        results.append({
+                            "symbol":     sym,
+                            "price":      float(item.get("price", 0)),
+                            "change_pct": float(item.get("percent_change", 0)),
+                        })
+                logger.info(f"📈 Alpaca movers returned {len(results)} gainers")
+                return results
             else:
-                logger.warning(f"FMP {endpoint} returned {r.status_code}")
-            return None
+                logger.warning(f"Alpaca movers returned {r.status_code}: {r.text[:200]}")
+                return []
+
         except Exception as e:
-            logger.warning(f"FMP error [{endpoint}]: {e}")
-            return None
-
-    def get_fmp_gainers(self):
-        """
-        Phase 1: Top gaining stocks right now from FMP.
-        Returns list of symbols that are up big today.
-        """
-        data = self._fmp_get("gainers")
-        if not data:
+            logger.warning(f"Alpaca movers error: {e}")
             return []
-        symbols = []
-        for item in data:
-            sym = item.get("ticker") or item.get("symbol", "")
-            if TICKER_RE.match(sym):
-                symbols.append({
-                    "symbol":     sym,
-                    "price":      float(item.get("price", 0)),
-                    "change_pct": float(item.get("changesPercentage", 0)),
-                })
-        logger.info(f"📈 FMP gainers returned {len(symbols)} stocks")
-        return symbols
-
-    def get_fmp_actives(self):
-        """
-        Phase 2: Most active stocks by volume from FMP.
-        Used after 9:30 AM to catch HOD intraday movers.
-        """
-        data = self._fmp_get("actives")
-        if not data:
-            return []
-        symbols = []
-        for item in data:
-            sym = item.get("ticker") or item.get("symbol", "")
-            if TICKER_RE.match(sym):
-                symbols.append({
-                    "symbol":     sym,
-                    "price":      float(item.get("price", 0)),
-                    "change_pct": float(item.get("changesPercentage", 0)),
-                })
-        logger.info(f"🔥 FMP actives returned {len(symbols)} stocks")
-        return symbols
 
     # ------------------------------------------------------------------ #
     #  Finnhub — enrichment                                               #
@@ -128,7 +110,6 @@ class VisionRossScanner:
             return None
 
     def get_quote(self, symbol):
-        """Finnhub quote for volume data."""
         data = self._finnhub_get("quote", {"symbol": symbol})
         time.sleep(0.15)
         if not data or data.get("c", 0) == 0:
@@ -141,7 +122,6 @@ class VisionRossScanner:
         }
 
     def calculate_rvol(self, symbol, today_volume, avg_volume):
-        """RVOL using Finnhub 10-day avg volume metric."""
         data = self._finnhub_get("stock/metric", {"symbol": symbol, "metric": "all"})
         time.sleep(0.15)
         if data and data.get("metric"):
@@ -159,7 +139,6 @@ class VisionRossScanner:
         return 0
 
     def get_candles(self, symbol, resolution="5", count=80):
-        """Intraday candles for reversal detection."""
         now = int(time.time())
         lookback = count * int(resolution) * 60 * 2
         data = self._finnhub_get("stock/candle", {
@@ -182,7 +161,6 @@ class VisionRossScanner:
             return None
 
     def has_news_today(self, symbol):
-        """Ross Pillar 3 — news catalyst."""
         today = date.today().strftime("%Y-%m-%d")
         data = self._finnhub_get("company-news", {
             "symbol": symbol,
@@ -212,47 +190,21 @@ class VisionRossScanner:
     # ------------------------------------------------------------------ #
 
     def scan_for_momentum(self):
-        """
-        Ross Cameron two-phase scan:
-        Phase 1 (before 9:30 AM ET): gainers = gap-up watchlist
-        Phase 2 (9:30 AM+ ET): actives = HOD intraday movers
-        Both phases then enriched with Finnhub RVOL + news
-        """
-        logger.info("🔄 VISION v12 — Ross Cameron 5 Pillar scan starting...")
+        """Ross Cameron 5 Pillar scan using Alpaca movers + Finnhub enrichment."""
+        logger.info("🔄 VISION v13 — Ross Cameron 5 Pillar scan starting...")
 
-        if not self.fmp_key:
-            logger.error("❌ FMP_API_KEY not set — cannot scan")
-            return []
-
-        # Determine phase based on time
-        et = pytz.timezone("America/New_York")
-        now_et = datetime.now(et)
-        is_premarket = now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30)
-
-        if is_premarket:
-            logger.info("📋 Phase 1 — Pre-market: fetching gap-up stocks from FMP")
-            universe = self.get_fmp_gainers()
-        else:
-            logger.info("📋 Phase 2 — Market hours: fetching top gainers + actives from FMP")
-            gainers = self.get_fmp_gainers()
-            actives = self.get_fmp_actives()
-            # Merge and deduplicate — gainers take priority
-            seen = set()
-            universe = []
-            for s in gainers + actives:
-                if s["symbol"] not in seen:
-                    seen.add(s["symbol"])
-                    universe.append(s)
+        # Step 1: Get top movers from Alpaca
+        universe = self.get_alpaca_movers()
 
         if not universe:
-            logger.warning("⚠️ FMP returned no stocks")
+            logger.warning("⚠️ Alpaca returned no movers")
             return []
 
-        # Apply price + gap filters
+        # Step 2: Price + gap filter
         filtered = []
         for s in universe:
             price = s.get("price", 0)
-            gap = s.get("change_pct", 0)
+            gap   = s.get("change_pct", 0)
 
             if price < self.MIN_PRICE or price > self.MAX_PRICE:
                 logger.debug(f"  {s['symbol']} ❌ price ${price:.2f}")
@@ -269,21 +221,17 @@ class VisionRossScanner:
             logger.info("No stocks passed filters — market may be slow today")
             return []
 
-        # Enrich with Finnhub
+        # Step 3: Finnhub enrichment — RVOL, news, candles
         qualified = []
         for s in filtered[:20]:
             symbol = s["symbol"]
             logger.info(f"  🔍 Enriching {symbol}...")
 
-            # Get volume from Finnhub quote
             quote = self.get_quote(symbol)
             if not quote:
                 continue
 
-            today_vol = quote["volume"]
-            avg_vol   = quote["avg_volume"]
-
-            rvol = self.calculate_rvol(symbol, today_vol, avg_vol)
+            rvol = self.calculate_rvol(symbol, quote["volume"], quote["avg_volume"])
             if rvol < self.MIN_RVOL:
                 logger.info(f"  {symbol} ❌ RVOL {rvol}x (need {self.MIN_RVOL}x)")
                 continue
