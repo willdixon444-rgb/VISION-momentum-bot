@@ -1,13 +1,13 @@
 """
-VISION Scanner v13 — Ross Cameron 5 Pillar Methodology
+VISION Scanner v14 — Ross Cameron 5 Pillar Methodology
 =======================================================
-Universe discovery: Alpaca Market Movers API (free, cloud-friendly)
-- /v1beta1/screener/stocks/movers → top gaining stocks right now
-Enrichment: Finnhub
-- RVOL, candles, news catalyst
+Fix from v13: Finnhub returns volume=0 for micro-cap stocks.
 
-Alpaca is a proper REST API — no scraping, no Cloudflare,
-works perfectly from Render cloud servers.
+v14 fix: Use Alpaca's own snapshot endpoint for volume data.
+Alpaca already has the data since it's surfacing these stocks —
+we just need to ask it for the volume too.
+
+Finnhub still used for: news catalyst check only.
 """
 
 import pandas as pd
@@ -21,10 +21,7 @@ import pytz
 
 logger = logging.getLogger("VISION_SCANNER")
 
-TICKER_RE = re.compile(r'^[A-Z]{1,5}$')
-
-# Alpaca paper trading base URL
-ALPACA_BASE = "https://paper-api.alpaca.markets/v2"
+TICKER_RE = re.compile(r'^[A-Z]{1,6}$')
 ALPACA_DATA_BASE = "https://data.alpaca.markets"
 
 
@@ -38,10 +35,6 @@ class VisionRossScanner:
         self.alpaca_secret = os.environ.get("ALPACA_SECRET_KEY", "")
         self.finnhub_key   = os.environ.get("FINNHUB_API_KEY", "")
 
-    # ------------------------------------------------------------------ #
-    #  Alpaca — universe discovery                                        #
-    # ------------------------------------------------------------------ #
-
     def _alpaca_headers(self):
         return {
             "APCA-API-KEY-ID":     self.alpaca_key,
@@ -49,24 +42,20 @@ class VisionRossScanner:
             "Accept": "application/json"
         }
 
-    def get_alpaca_movers(self):
-        """
-        Get top gaining stocks from Alpaca's market movers endpoint.
-        Returns list of {symbol, price, change_pct}
-        Free with any Alpaca account — works from cloud servers.
-        """
-        if not self.alpaca_key or not self.alpaca_secret:
-            logger.error("❌ ALPACA_API_KEY or ALPACA_SECRET_KEY not set")
-            return []
+    # ------------------------------------------------------------------ #
+    #  Alpaca — universe + volume data                                    #
+    # ------------------------------------------------------------------ #
 
+    def get_alpaca_movers(self):
+        """Top gaining stocks from Alpaca movers endpoint."""
+        if not self.alpaca_key or not self.alpaca_secret:
+            logger.error("❌ Alpaca keys not set")
+            return []
         try:
             url = f"{ALPACA_DATA_BASE}/v1beta1/screener/stocks/movers"
-            params = {"top": 50}
-            r = requests.get(url, headers=self._alpaca_headers(), params=params, timeout=10)
-
+            r = requests.get(url, headers=self._alpaca_headers(), params={"top": 50}, timeout=10)
             if r.status_code == 200:
-                data = r.json()
-                gainers = data.get("gainers", [])
+                gainers = r.json().get("gainers", [])
                 results = []
                 for item in gainers:
                     sym = item.get("symbol", "")
@@ -79,15 +68,90 @@ class VisionRossScanner:
                 logger.info(f"📈 Alpaca movers returned {len(results)} gainers")
                 return results
             else:
-                logger.warning(f"Alpaca movers returned {r.status_code}: {r.text[:200]}")
+                logger.warning(f"Alpaca movers {r.status_code}: {r.text[:200]}")
                 return []
-
         except Exception as e:
             logger.warning(f"Alpaca movers error: {e}")
             return []
 
+    def get_alpaca_snapshots(self, symbols):
+        """
+        Get snapshots for a list of symbols from Alpaca.
+        Returns dict of {symbol: {volume, vwap, prev_close, ...}}
+        Alpaca snapshot includes today's volume — reliable for micro-caps.
+        """
+        if not symbols:
+            return {}
+        try:
+            url = f"{ALPACA_DATA_BASE}/v2/stocks/snapshots"
+            params = {
+                "symbols": ",".join(symbols),
+                "feed": "iex"  # IEX feed works on free tier
+            }
+            r = requests.get(url, headers=self._alpaca_headers(), params=params, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                results = {}
+                for sym, snap in data.items():
+                    try:
+                        daily = snap.get("dailyBar", {})
+                        prev  = snap.get("prevDailyBar", {})
+                        results[sym] = {
+                            "volume":     daily.get("v", 0),
+                            "prev_volume": prev.get("v", 0),
+                            "vwap":       daily.get("vw", 0),
+                            "open":       daily.get("o", 0),
+                            "high":       daily.get("h", 0),
+                            "low":        daily.get("l", 0),
+                            "close":      daily.get("c", 0),
+                            "prev_close": prev.get("c", 0),
+                        }
+                    except Exception:
+                        pass
+                logger.info(f"📊 Alpaca snapshots returned data for {len(results)} symbols")
+                return results
+            else:
+                logger.warning(f"Alpaca snapshots {r.status_code}: {r.text[:200]}")
+                return {}
+        except Exception as e:
+            logger.warning(f"Alpaca snapshots error: {e}")
+            return {}
+
+    def calculate_rvol(self, symbol, today_volume, prev_volume):
+        """
+        RVOL = today's volume / previous day's volume.
+        Simple and reliable using Alpaca data.
+        For more accuracy we use Finnhub 10-day avg if available.
+        """
+        # Try Finnhub 10-day avg first
+        if self.finnhub_key:
+            try:
+                url = f"https://finnhub.io/api/v1/stock/metric"
+                params = {"symbol": symbol, "metric": "all", "token": self.finnhub_key}
+                r = requests.get(url, params=params, timeout=8)
+                time.sleep(0.15)
+                if r.status_code == 200:
+                    m = r.json().get("metric", {})
+                    avg_vol_m = m.get("10DayAverageTradingVolume") or m.get("3MonthAverageTradingVolume")
+                    if avg_vol_m and avg_vol_m > 0:
+                        avg_vol = avg_vol_m * 1_000_000
+                        rvol = today_volume / avg_vol
+                        logger.info(f"  {symbol} RVOL: {rvol:.1f}x (today:{today_volume:,} / 10d-avg:{avg_vol:,.0f})")
+                        return round(rvol, 1)
+            except Exception:
+                pass
+
+        # Fallback: compare to yesterday's volume
+        if prev_volume and prev_volume > 0:
+            rvol = today_volume / prev_volume
+            logger.info(f"  {symbol} RVOL (vs yesterday): {rvol:.1f}x (today:{today_volume:,} / prev:{prev_volume:,})")
+            return round(rvol, 1)
+
+        logger.info(f"  {symbol} RVOL: could not calculate")
+        return 0
+
     # ------------------------------------------------------------------ #
-    #  Finnhub — enrichment                                               #
+    #  Finnhub — news only                                                #
     # ------------------------------------------------------------------ #
 
     def _finnhub_get(self, endpoint, params=None):
@@ -109,80 +173,34 @@ class VisionRossScanner:
             logger.warning(f"Finnhub [{endpoint}] error: {e}")
             return None
 
-    def get_quote(self, symbol):
-        data = self._finnhub_get("quote", {"symbol": symbol})
-        time.sleep(0.15)
-        if not data or data.get("c", 0) == 0:
-            return None
-        return {
-            "price":      data.get("c", 0),
-            "prev_close": data.get("pc", 0),
-            "volume":     data.get("v", 0),
-            "avg_volume": data.get("av", 0),
-        }
-
-    def calculate_rvol(self, symbol, today_volume, avg_volume):
-        data = self._finnhub_get("stock/metric", {"symbol": symbol, "metric": "all"})
-        time.sleep(0.15)
-        if data and data.get("metric"):
-            m = data["metric"]
-            avg_vol_m = m.get("10DayAverageTradingVolume") or m.get("3MonthAverageTradingVolume")
-            if avg_vol_m and avg_vol_m > 0:
-                avg_vol_shares = avg_vol_m * 1_000_000
-                rvol = today_volume / avg_vol_shares
-                logger.info(f"  {symbol} RVOL: {rvol:.1f}x (today:{today_volume:,} / 10d-avg:{avg_vol_shares:,.0f})")
-                return round(rvol, 1)
-        if avg_volume and avg_volume > 0:
-            rvol = today_volume / avg_volume
-            logger.info(f"  {symbol} RVOL (quote fallback): {rvol:.1f}x")
-            return round(rvol, 1)
-        return 0
-
-    def get_candles(self, symbol, resolution="5", count=80):
-        now = int(time.time())
-        lookback = count * int(resolution) * 60 * 2
-        data = self._finnhub_get("stock/candle", {
-            "symbol": symbol,
-            "resolution": resolution,
-            "from": now - lookback,
-            "to": now
-        })
-        if not data or data.get("s") != "ok":
-            return None
-        try:
-            return pd.DataFrame({
-                "Open":   data["o"],
-                "High":   data["h"],
-                "Low":    data["l"],
-                "Close":  data["c"],
-                "Volume": data["v"],
-            })
-        except Exception:
-            return None
-
     def has_news_today(self, symbol):
+        """Ross Pillar 3 — news catalyst."""
         today = date.today().strftime("%Y-%m-%d")
         data = self._finnhub_get("company-news", {
             "symbol": symbol,
             "_from": today,
             "to": today
         })
-        time.sleep(0.15)
+        time.sleep(0.12)
         has = bool(data and len(data) > 0)
         if has:
             logger.info(f"  📰 {symbol} has {len(data)} news item(s) today")
         return has
 
-    def detect_reversal(self, df):
-        if df is None or len(df) < 3:
+    def detect_reversal(self, snap):
+        """Simple reversal detection using OHLC from Alpaca snapshot."""
+        if not snap:
             return False
-        last, prev = df.iloc[-1], df.iloc[-2]
-        if last["Close"] > prev["High"] and last["Volume"] > prev["Volume"] * 1.5:
+        high  = snap.get("high", 0)
+        low   = snap.get("low", 0)
+        close = snap.get("close", 0)
+        open_ = snap.get("open", 0)
+        # Strong close near high of day = momentum
+        if high > 0 and (close - low) / (high - low + 0.001) > 0.7:
             return True
-        if len(df) > 10:
-            low_zone = df["Low"].iloc[-10:].min()
-            if last["Low"] <= low_zone * 1.01 and last["Close"] > last["Open"] * 1.02:
-                return True
+        # Big move from open
+        if open_ > 0 and (close - open_) / open_ > 0.05:
+            return True
         return False
 
     # ------------------------------------------------------------------ #
@@ -190,12 +208,11 @@ class VisionRossScanner:
     # ------------------------------------------------------------------ #
 
     def scan_for_momentum(self):
-        """Ross Cameron 5 Pillar scan using Alpaca movers + Finnhub enrichment."""
-        logger.info("🔄 VISION v13 — Ross Cameron 5 Pillar scan starting...")
+        """Ross Cameron 5 Pillar scan — Alpaca movers + Alpaca volume + Finnhub news."""
+        logger.info("🔄 VISION v14 — Ross Cameron 5 Pillar scan starting...")
 
-        # Step 1: Get top movers from Alpaca
+        # Step 1: Get top movers
         universe = self.get_alpaca_movers()
-
         if not universe:
             logger.warning("⚠️ Alpaca returned no movers")
             return []
@@ -205,14 +222,10 @@ class VisionRossScanner:
         for s in universe:
             price = s.get("price", 0)
             gap   = s.get("change_pct", 0)
-
             if price < self.MIN_PRICE or price > self.MAX_PRICE:
-                logger.debug(f"  {s['symbol']} ❌ price ${price:.2f}")
                 continue
             if gap < self.MIN_GAP:
-                logger.debug(f"  {s['symbol']} ❌ gap {gap:.1f}%")
                 continue
-
             filtered.append(s)
             logger.info(f"  {s['symbol']} ✓ ${price:.2f} | +{gap:.1f}%")
 
@@ -221,25 +234,28 @@ class VisionRossScanner:
             logger.info("No stocks passed filters — market may be slow today")
             return []
 
-        # Step 3: Finnhub enrichment — RVOL, news, candles
+        # Step 3: Get Alpaca snapshots for volume data (batch call)
+        symbols = [s["symbol"] for s in filtered[:20]]
+        snapshots = self.get_alpaca_snapshots(symbols)
+
+        # Step 4: RVOL + news + reversal
         qualified = []
         for s in filtered[:20]:
             symbol = s["symbol"]
-            logger.info(f"  🔍 Enriching {symbol}...")
+            snap   = snapshots.get(symbol, {})
 
-            quote = self.get_quote(symbol)
-            if not quote:
-                continue
+            today_vol = snap.get("volume", 0)
+            prev_vol  = snap.get("prev_volume", 0)
 
-            rvol = self.calculate_rvol(symbol, quote["volume"], quote["avg_volume"])
+            logger.info(f"  🔍 {symbol} vol today:{today_vol:,} prev:{prev_vol:,}")
+
+            rvol = self.calculate_rvol(symbol, today_vol, prev_vol)
             if rvol < self.MIN_RVOL:
                 logger.info(f"  {symbol} ❌ RVOL {rvol}x (need {self.MIN_RVOL}x)")
                 continue
 
             has_news = self.has_news_today(symbol)
-            df = self.get_candles(symbol)
-            time.sleep(0.15)
-            reversal = self.detect_reversal(df)
+            reversal = self.detect_reversal(snap)
 
             score  = min(rvol / self.MIN_RVOL, 4) * 35
             score += min(s["change_pct"] / 10, 3) * 25
