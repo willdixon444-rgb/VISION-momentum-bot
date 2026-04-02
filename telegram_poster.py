@@ -36,22 +36,41 @@ def send_message(message: str) -> bool:
         logger.error(f"Telegram request failed: {e}")
         return False
 
-def post_trade_entry(ticker, side, price, signal_type, rvol, gap, float_m):
-    """Main alert for Vision — Instant Reversal or Momentum Watch"""
+def post_trade_entry(ticker, side, price, signal_type, rvol, gap, float_m,
+                     stop_loss=None, profit_target=None):
+    """
+    Main alert for Vision — Bull Flag or Momentum Watch
+    Includes Ross Cameron's full scale-out exit strategy
+    """
     if signal_type == "REVERSAL":
-        header = "🚨 <b>INSTANT REVERSAL ALERT</b>"
+        header = "🚩 <b>BULL FLAG ALERT</b>"
     else:
         header = "🔭 <b>MOMENTUM WATCH</b>"
+
+    # Calculate scale-out levels
+    stop    = stop_loss    if stop_loss    else round(price - 0.20, 2)
+    target1 = profit_target if profit_target else round(price + 0.40, 2)
+    target2 = round(price + 0.80, 2)   # second target if momentum continues
 
     msg = (
         f"{header}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>Ticker:</b> <code>{ticker}</code>\n"
         f"<b>Action:</b> {side}\n"
-        f"<b>Price:</b> ${price}\n"
+        f"<b>Entry:</b> ${price}\n"
         f"<b>Gap:</b> {gap}%\n"
         f"<b>RVOL:</b> {rvol}x\n"
-        f"<b>Float:</b> {float_m}M shares\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>TRADE PLAN (Ross Cameron)</b>\n"
+        f"🔴 Stop Loss:  ${stop} (-20¢)\n"
+        f"🟡 Target 1:   ${target1} (+40¢) → <b>SELL HALF</b>\n"
+        f"🟢 Target 2:   ${target2} (+80¢) → sell remainder\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📋 <b>EXIT RULES</b>\n"
+        f"• Hit T1 → sell half, move stop to breakeven\n"
+        f"• Hold rest above 9 EMA\n"
+        f"• Parabolic spike → sell into strength\n"
+        f"• First red candle (if no T1 hit) → EXIT ALL\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🕒 {_now_et()}"
     )
