@@ -1,7 +1,7 @@
 """
-VISION Scanner v15 — Ross Cameron 5 Pillar + Bull Flag Detection
+VISION Scanner v16 — Ross Cameron 5 Pillar + Bull Flag Detection
 ================================================================
-New in v15:
+New in v16:
 - VWAP calculation from today's 1-min candles
 - 9 EMA calculation
 - Bull flag detection: 2-3 red candles + first green candle making new high
@@ -284,7 +284,7 @@ class VisionRossScanner:
 
     def scan_for_momentum(self):
         """Ross Cameron 5 Pillar scan with bull flag + VWAP + 9 EMA."""
-        logger.info("🔄 VISION v15 — Ross Cameron 5 Pillar + Bull Flag scan starting...")
+        logger.info("🔄 VISION v16 — Ross Cameron 5 Pillar + Bull Flag scan starting...")
 
         # Step 1: Get top movers from Alpaca
         universe = self.get_alpaca_movers()
