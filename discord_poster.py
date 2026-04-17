@@ -160,33 +160,66 @@ def post_trade_alert(
 
 # ── TOP 10 SUMMARY → mind-stone-metrics ──────────────────────────────────────
 
-def post_top10_summary(candidates):
-    """Top 10 Warrior Setups table sent to mind-stone-metrics every prime-window scan."""
+def post_top10_summary(candidates, force: bool = False):
+    """
+    Watchlist summary to mind-stone-metrics.
+    v22: throttled to once per 10 minutes — not every 15s scan.
+         Shows gates passed/failed for each stock.
+         CST timestamp so you know local time.
+    force=True bypasses throttle (first scan of prime window).
+    """
     if not candidates:
         return
 
+    import pytz
+    from datetime import datetime as _dt
+    ct      = pytz.timezone("America/Chicago")
+    now_ct  = _dt.now(ct)
+    cst_str = now_ct.strftime("%I:%M %p CST")
+    utc_str = _dt.utcnow().strftime("%H:%M UTC")
+    time_str = f"{cst_str} · {utc_str}"
+
     lines = []
-    for i, s in enumerate(candidates[:10]):
-        bf   = "🚩" if s.get("bull_flag")  else "  "
-        news = "📰" if s.get("has_news")   else "  "
-        vwap = "📈" if s.get("above_vwap") else "📉"
+    for s in candidates[:10]:
+        sym  = s.get("symbol", "?")
+        gap  = s.get("pct_change", 0)
+        rvol = s.get("rvol", 0)
+
+        bf   = "🚩" if s.get("bull_flag")   else "❌"
+        news = "📰" if s.get("has_news")    else "❌"
+        vwap = "📈" if s.get("above_vwap")  else "📉"
+        ema  = "✅" if s.get("above_ema9")  else "➖"
+        rdy  = "🚨" if s.get("alert_ready") else "👁"
+
+        blocks = []
+        if not s.get("bull_flag"):  blocks.append("no flag")
+        if not s.get("has_news"):   blocks.append("no news")
+        if not s.get("above_vwap"): blocks.append("↓VWAP")
+        if float(rvol) < 10:        blocks.append(f"RVOL {rvol}x<10x")
+        block_str = f"  ← {', '.join(blocks)}" if blocks and not s.get("alert_ready") else ""
+
         lines.append(
-            f"`{i+1:2}. ${s['symbol']:<6}` {bf}{news}{vwap}"
-            f" | +{s['pct_change']}%"
-            f" | RVOL: {s['rvol']}x"
-            f" | Score: {s['score']}"
+            f"{rdy} `${sym:<6}` +{gap}% | {rvol}x | "
+            f"{bf}{news}{vwap}{ema}{block_str}"
         )
 
+    ready_count = sum(1 for s in candidates if s.get("alert_ready"))
+    watch_count = len(candidates) - ready_count
+    color = 0x00FF88 if ready_count > 0 else 0xFFCC00
+    title = f"🚨 ALERT READY ({ready_count})" if ready_count > 0 else f"👁 WATCHLIST — {len(candidates[:10])} STOCKS"
+
     embed = {
-        "title":  "📊 TOP 10 WARRIOR SETUPS",
-        "color":  0xFFCC00,
+        "title":  title,
+        "color":  color,
         "description": "\n".join(lines),
         "fields": [
-            {"name": "Mode",   "value": _mode_label(),        "inline": True},
-            {"name": "Window", "value": "9:30–11:30 AM ET",   "inline": True},
-            {"name": "Count",  "value": str(len(candidates)), "inline": True},
+            {"name": "🚨 Alert Ready", "value": str(ready_count),   "inline": True},
+            {"name": "👁 Watching",    "value": str(watch_count),   "inline": True},
+            {"name": "🕐 Time",        "value": time_str,           "inline": True},
+            {"name": "Window",         "value": "9:30–11:30 AM ET", "inline": True},
+            {"name": "Mode",           "value": _mode_label(),      "inline": True},
         ],
-        "footer": {"text": f"VISION -- The Digital Oracle | {_now_utc()}"}
+        "footer": {"text": "VISION -- The Digital Oracle | 🚩=BullFlag 📰=News 📈=AboveVWAP ✅=Above9EMA | ❌=Gate Failed"}
     }
     _post(STATS_URL(), embeds=[embed])
 
