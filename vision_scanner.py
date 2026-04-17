@@ -1,7 +1,7 @@
 """
-VISION Scanner v21 — Gap and Go + Chart Snapshot at Alert Time
+VISION Scanner v22 — Gap and Go + Chart Snapshot at Alert Time
 ==============================================================
-New in v21:
+New in v22:
 1. GAP AND GO DETECTOR (9:30-9:35 AM ET only)
    - Separate from bull flag strategy — fires right at open
    - Requires: news + RVOL 10x+ + gap 15%+ + first candle green + above VWAP
@@ -593,12 +593,16 @@ class VisionRossScanner:
             score += 10
 
         # ── Alert readiness — Ross Cameron hard gates ──────────────────
-        # These must ALL pass for a trade alert to fire during prime window
+        # News gate has a high-RVOL override:
+        # If RVOL >= 50x the volume itself IS the signal (Ross trades these)
+        # Below 50x RVOL, news is required
+        news_required = self.ALERT_REQUIRE_NEWS and rvol < 50.0
+
         alert_reasons_failed = []
         if self.ALERT_REQUIRE_BULL_FLAG and not bull_flag:
             alert_reasons_failed.append("no bull flag")
-        if self.ALERT_REQUIRE_NEWS and not has_news:
-            alert_reasons_failed.append("no news catalyst")
+        if news_required and not has_news:
+            alert_reasons_failed.append("no news (RVOL<50x)")
         if rvol < self.ALERT_MIN_RVOL:
             alert_reasons_failed.append(f"RVOL {rvol}x < {self.ALERT_MIN_RVOL}x")
         if not above_vwap:
@@ -607,7 +611,9 @@ class VisionRossScanner:
         alert_ready = len(alert_reasons_failed) == 0
 
         if not alert_ready:
-            logger.info(f"  ⚠️  {symbol} on watchlist but NOT alert-ready: {', '.join(alert_reasons_failed)}")
+            logger.info(f"  ⚠️  {symbol} WATCHLIST — blocked: {', '.join(alert_reasons_failed)}")
+        elif rvol >= 50.0 and not has_news:
+            logger.info(f"  ✅ {symbol} ALERT READY — high RVOL {rvol}x overrides news gate")
 
         enriched = {
             "symbol":      symbol,
@@ -652,7 +658,7 @@ class VisionRossScanner:
         2. Smart enrichment — only re-enriches new symbols, caches returning ones
         3. Volume-scaled sizing — returned with each qualified stock
         """
-        logger.info("🔄 VISION v21 — Ross Cameron scan starting...")
+        logger.info("🔄 VISION v22 — Ross Cameron scan starting...")
         self._scan_count += 1
 
         et  = pytz.timezone("America/New_York")
