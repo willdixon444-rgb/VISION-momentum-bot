@@ -1,7 +1,7 @@
 """
-VISION Engine v21
+VISION Engine v22
 =================
-New in v21:
+New in v22:
 1. GAP AND GO — fires 9:30-9:35 AM ET on first green candle + news + RVOL 10x+
 2. CHART SNAPSHOT — captures 1-min and 5-min candles at exact alert time
    Stored in database for backtesting review
@@ -42,6 +42,8 @@ class VisionEngine:
         self._scan_running   = False
         self._alerted_today  = {}
         self._eod_posted     = False
+        self._last_summary_time = 0.0   # throttle top10 to once per 10 min
+        self._prime_first_scan  = True  # force summary on first prime window scan
         self._webull_enabled = os.environ.get("ENABLE_WEBULL", "false").lower() == "true"
 
         # Scan interval: 15 seconds
@@ -171,7 +173,8 @@ class VisionEngine:
             logger.info("📊 EOD paper summary posted")
 
         if now.hour < 9:
-            self._eod_posted = False
+            self._eod_posted    = False
+            self._prime_first_scan = True  # reset for next trading day
 
     # ── Main scan ─────────────────────────────────────────────────────
 
@@ -297,8 +300,20 @@ class VisionEngine:
                 self._open_paper_positions(symbol, price, shares, stock)
                 self._record_alert(symbol, price)
 
-            # Top 10 to mind-stone-metrics
-            post_top10_summary(top_10)
+            # Top 10 to mind-stone-metrics — throttled to once per 10 min
+            # Always fires on first scan of prime window so you see it immediately
+            import time as _time
+            now_ts   = _time.time()
+            elapsed  = now_ts - self._last_summary_time
+            should_post = (
+                self._prime_first_scan or      # first scan of prime window today
+                elapsed >= 600 or              # 10 minutes since last post
+                len(alert_ready) > 0           # always post when alert ready
+            )
+            if should_post:
+                post_top10_summary(top_10, force=self._prime_first_scan)
+                self._last_summary_time = now_ts
+                self._prime_first_scan  = False
 
         except Exception as e:
             logger.error(f"Scan error: {e}")
